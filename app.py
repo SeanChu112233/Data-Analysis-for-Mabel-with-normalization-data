@@ -4,7 +4,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.linear_model import LinearRegression
-from sklearn.preprocessing import PolynomialFeatures
+from sklearn.preprocessing import PolynomialFeatures, StandardScaler
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.metrics import r2_score, mean_squared_error
 from sklearn.model_selection import cross_val_score, ShuffleSplit
@@ -27,7 +27,8 @@ st.set_page_config(
 st.title("📊 推出力-温度/时间条件数据分析工具 for Mabel")
 st.markdown("""
     该工具用于分析温度(temp)、时间(time)与推出力(force)之间的关系，
-    支持多种回归模型分析，并提供可视化结果。请上传包含相关数据的CSV文件。
+    支持多种回归模型分析，并提供可视化结果。程序会自动对比数据归一化前后的模型表现。
+    请上传包含相关数据的CSV文件。
 """)
 
 # 侧边栏 - 文件上传和参数设置
@@ -80,17 +81,44 @@ def main():
             with st.expander("查看原始数据", expanded=False):
                 st.dataframe(data, use_container_width=True)
             
-            # 训练模型
-            models = train_models(data)
+            # 准备数据 - 原始和归一化版本
+            X_original = data[['Temp', 'Time']]
+            y = data['Force']
+            
+            # 数据归一化
+            scaler = StandardScaler()
+            X_scaled = scaler.fit_transform(X_original)
+            X_scaled_df = pd.DataFrame(X_scaled, columns=['Temp', 'Time'])
+            
+            # 显示归一化前后的数据对比
+            with st.expander("查看归一化前后数据对比", expanded=False):
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.subheader("原始数据")
+                    st.dataframe(X_original.describe(), use_container_width=True)
+                with col2:
+                    st.subheader("归一化后数据")
+                    st.dataframe(X_scaled_df.describe(), use_container_width=True)
+            
+            # 训练模型 - 原始和归一化两种版本
+            models_original = train_models(X_original, y)
+            models_scaled = train_models(X_scaled_df, y)
+            
+            # 对比归一化前后的模型性能
+            compare_normalization_effect(models_original, models_scaled, model_option)
+            
+            # 选择更优的模型集
+            best_version, best_models = select_better_version(models_original, models_scaled, model_option)
+            st.success(f"基于交叉验证R²值，选择{'归一化后' if best_version == 'scaled' else '原始数据'}的模型进行后续分析")
             
             # 显示模型评估结果
-            show_model_evaluation(models, data)
+            show_model_evaluation(best_models, data, best_version)
             
             # 显示可视化结果
-            show_visualizations(models, data, model_option)
+            show_visualizations(best_models, data, model_option, best_version, scaler if best_version == 'scaled' else None)
             
             # 交互式预测
-            show_prediction_tool(models, data, model_option)
+            show_prediction_tool(best_models, data, model_option, best_version, scaler if best_version == 'scaled' else None)
             
         except Exception as e:
             st.error(f"处理数据时出错: {str(e)}")
@@ -104,11 +132,8 @@ def main():
         })
         st.dataframe(sample_data, use_container_width=True)
 
-def train_models(data):
+def train_models(X, y):
     """训练所有回归模型"""
-    X = data[['Temp', 'Time']]
-    y = data['Force']
-    
     models = {}
     
     # 1. 线性回归
@@ -139,11 +164,13 @@ def train_models(data):
     }
     
     # 4. 梯度提升树回归
-    gb_model = GradientBoostingRegressor( n_estimators=30,        # 减少树的数量（从100→30）
-    max_depth=3,            # 限制树深度（防止过度分裂）
-    min_samples_leaf=2,     # 增加叶节点最小样本数
-    subsample=0.8,          # 使用80%的样本训练每棵树
-    random_state=42)
+    gb_model = GradientBoostingRegressor(
+        n_estimators=30,        # 减少树的数量
+        max_depth=3,            # 限制树深度
+        min_samples_leaf=2,     # 增加叶节点最小样本数
+        subsample=0.8,          # 使用80%的样本训练每棵树
+        random_state=42
+    )
     gb_model.fit(X, y)
     models["梯度提升树"] = {
         "model": gb_model,
@@ -188,9 +215,82 @@ def predict_with_model(model_name, models, X):
     else:
         return model.predict(X)
 
-def show_model_evaluation(models, data):
+def compare_normalization_effect(models_original, models_scaled, selected_model):
+    """对比归一化前后的模型性能"""
+    st.subheader("📊 归一化前后模型性能对比")
+    
+    # 准备对比数据
+    compare_data = []
+    
+    # 对比所选模型
+    orig_info = models_original[selected_model]
+    scaled_info = models_scaled[selected_model]
+    
+    compare_data.append({
+        "评估指标": "训练R²",
+        "原始数据": f"{orig_info['train_r2']:.4f}",
+        "归一化后": f"{scaled_info['train_r2']:.4f}",
+        "变化": f"{(scaled_info['train_r2'] - orig_info['train_r2']):+.4f}"
+    })
+    
+    compare_data.append({
+        "评估指标": "交叉验证R²",
+        "原始数据": f"{orig_info['cv_r2_mean']:.4f}",
+        "归一化后": f"{scaled_info['cv_r2_mean']:.4f}",
+        "变化": f"{(scaled_info['cv_r2_mean'] - orig_info['cv_r2_mean']):+.4f}"
+    })
+    
+    compare_data.append({
+        "评估指标": "训练RMSE",
+        "原始数据": f"{orig_info['train_rmse']:.4f}",
+        "归一化后": f"{scaled_info['train_rmse']:.4f}",
+        "变化": f"{(scaled_info['train_rmse'] - orig_info['train_rmse']):+.4f}"
+    })
+    
+    compare_df = pd.DataFrame(compare_data)
+    
+    # 高亮显示更好的结果
+    def highlight_better(row):
+        styles = []
+        metric = row['评估指标']
+        orig_val = float(row['原始数据'])
+        scaled_val = float(row['归一化后'])
+        
+        for col in row.index:
+            if col == '原始数据':
+                # R²越大越好，RMSE越小越好
+                if (metric.endswith('R²') and orig_val > scaled_val) or \
+                   (metric.endswith('RMSE') and orig_val < scaled_val):
+                    styles.append('background-color: #90EE90')
+                else:
+                    styles.append('')
+            elif col == '归一化后':
+                if (metric.endswith('R²') and scaled_val > orig_val) or \
+                   (metric.endswith('RMSE') and scaled_val < orig_val):
+                    styles.append('background-color: #90EE90')
+                else:
+                    styles.append('')
+            else:
+                styles.append('')
+        return styles
+    
+    styled_df = compare_df.style.apply(highlight_better, axis=1)
+    st.dataframe(styled_df, use_container_width=True)
+
+def select_better_version(models_original, models_scaled, selected_model):
+    """选择性能更好的模型版本（原始或归一化）"""
+    orig_score = models_original[selected_model]['cv_r2_mean']
+    scaled_score = models_scaled[selected_model]['cv_r2_mean']
+    
+    # 如果归一化后交叉验证R²更高，则选择归一化版本
+    if scaled_score > orig_score:
+        return 'scaled', models_scaled
+    else:
+        return 'original', models_original
+
+def show_model_evaluation(models, data, version):
     """显示模型评估结果"""
-    st.subheader("📈 模型评估结果")
+    st.subheader(f"📈 模型评估结果 ({'归一化后' if version == 'scaled' else '原始数据'})")
     
     # 准备评估结果数据
     eval_data = []
@@ -216,7 +316,7 @@ def show_model_evaluation(models, data):
     
     st.info(f"推荐模型: **{best_model}** (基于交叉验证R²最高)")
 
-def show_visualizations(models, data, model_name):
+def show_visualizations(models, data, model_name, version, scaler):
     """显示数据可视化结果"""
     st.subheader("🔍 数据可视化")
     
@@ -230,8 +330,15 @@ def show_visualizations(models, data, model_name):
     X_grid, Y_grid = np.meshgrid(x_range, y_range)
     grid_data = np.column_stack([X_grid.ravel(), Y_grid.ravel()])
     
+    # 如果使用归一化模型，需要对网格数据进行归一化
+    if version == 'scaled' and scaler is not None:
+        grid_data_scaled = scaler.transform(grid_data)
+        grid_data_processed = pd.DataFrame(grid_data_scaled, columns=['Temp', 'Time'])
+    else:
+        grid_data_processed = pd.DataFrame(grid_data, columns=['Temp', 'Time'])
+    
     # 获取模型预测值
-    Z_grid = predict_with_model(model_name, models, grid_data)
+    Z_grid = predict_with_model(model_name, models, grid_data_processed)
     Z_grid = Z_grid.reshape(X_grid.shape)
     
     # 分为两列显示图表
@@ -301,7 +408,7 @@ def show_visualizations(models, data, model_name):
     sns.heatmap(corr, annot=True, cmap='coolwarm', ax=ax)
     st.pyplot(fig)
 
-def show_prediction_tool(models, data, model_name):
+def show_prediction_tool(models, data, model_name, version, scaler):
     """显示交互式预测工具"""
     st.subheader("🔮 推出力预测")
     
@@ -332,9 +439,18 @@ def show_prediction_tool(models, data, model_name):
             value=float(data['Time'].mean())
         )
     
-    # 预测推出力
+    # 准备预测数据
     X_pred = pd.DataFrame([[temp, time]], columns=['Temp', 'Time'])
-    force_pred = predict_with_model(model_name, models, X_pred)[0]
+    
+    # 如果使用归一化模型，需要对输入数据进行归一化
+    if version == 'scaled' and scaler is not None:
+        X_pred_scaled = scaler.transform(X_pred)
+        X_pred_processed = pd.DataFrame(X_pred_scaled, columns=['Temp', 'Time'])
+    else:
+        X_pred_processed = X_pred
+    
+    # 预测推出力
+    force_pred = predict_with_model(model_name, models, X_pred_processed)[0]
     
     # 显示预测结果
     st.metric("预测推出力", f"{force_pred:.4f}", delta=None)
@@ -347,23 +463,32 @@ def show_prediction_tool(models, data, model_name):
         coefs = model_info["model"].coef_
         intercept = model_info["model"].intercept_
         
-        st.latex(f"推出力 = {intercept:.4f} + {coefs[0]:.4f} \\times 温度 + {coefs[1]:.4f} \\times 时间")
+        if version == 'scaled':
+            st.info("注意：归一化后的线性回归系数不能直接比较原始特征的影响大小，因为特征已被标准化")
+            st.latex(f"推出力 = {intercept:.4f} + {coefs[0]:.4f} \\times 标准化温度 + {coefs[1]:.4f} \\times 标准化时间")
+        else:
+            st.latex(f"推出力 = {intercept:.4f} + {coefs[0]:.4f} \\times 温度 + {coefs[1]:.4f} \\times 时间")
+        
         st.write(f"决定系数 R²: {model_info['train_r2']:.4f}")
         
-        # 分析影响大小
-        temp_impact = abs(coefs[0])
-        time_impact = abs(coefs[1])
-        
-        if temp_impact > time_impact:
-            st.info(f"温度对推出力的影响更大 (影响比例: {temp_impact/time_impact:.2f}:1)")
-        elif time_impact > temp_impact:
-            st.info(f"时间对推出力的影响更大 (影响比例: 1:{time_impact/temp_impact:.2f})")
-        else:
-            st.info("温度和时间对推出力的影响大致相同")
+        # 分析影响大小（仅对原始数据有意义）
+        if version != 'scaled':
+            temp_impact = abs(coefs[0])
+            time_impact = abs(coefs[1])
+            
+            if temp_impact > time_impact:
+                st.info(f"温度对推出力的影响更大 (影响比例: {temp_impact/time_impact:.2f}:1)")
+            elif time_impact > temp_impact:
+                st.info(f"时间对推出力的影响更大 (影响比例: 1:{time_impact/temp_impact:.2f})")
+            else:
+                st.info("温度和时间对推出力的影响大致相同")
     
     elif model_name == "多项式回归":
         st.write(f"决定系数 R²: {model_info['train_r2']:.4f}")
-        st.info("模型包含温度、时间的二次项以及交互项，表明它们对推出力的影响是非线性的，在不同范围内影响程度不同")
+        if version == 'scaled':
+            st.info("模型包含标准化温度、标准化时间的二次项以及交互项，表明它们对推出力的影响是非线性的")
+        else:
+            st.info("模型包含温度、时间的二次项以及交互项，表明它们对推出力的影响是非线性的，在不同范围内影响程度不同")
     
     else:  # 随机森林和梯度提升树
         st.write(f"决定系数 R²: {model_info['train_r2']:.4f}")
@@ -396,4 +521,3 @@ def add_footer():
 if __name__ == "__main__":
     main()
     add_footer()
-    
